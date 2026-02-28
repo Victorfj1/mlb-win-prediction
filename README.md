@@ -25,4 +25,4 @@ The dataset was originally provided as part of graduate econometrics coursework.
 ## Author
 
 Victor Johnson  
-M.S. Applied Economics (Analytics)
+M.S. Applied Economics Candidate
