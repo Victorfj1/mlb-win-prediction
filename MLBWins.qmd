@@ -1,0 +1,649 @@
+---
+title: "Predicting MLB Team Wins Using Statistical Modeling"
+author: "Victor Johnson"
+format: html
+editor: visual
+toc: true
+toc_depth: 2
+toc_location: left
+number-sections: true
+code-link: true
+---
+
+\newpage
+
+# Introduction
+
+This report analyzes team-data from Major League Baseball (MLB) spanning from 1871-2006 to identify key variables that impact wins. Using the training data set, I clean and transform several variables, create new metrics such as OPS (on-base plus slugging percentage), and address missing/skewed data. Finally, I perform several regressions and choose the one that best predicts a professional baseball team's total wins for a season.
+
+```{r, echo=FALSE,warning=FALSE,message=FALSE}
+# Packages
+library(tidyverse)
+library(stargazer)
+library(knitr)
+library(kableExtra)
+library(visdat)
+library(psych)
+library(naniar)
+library(car)
+library(broom)
+library(tidyr)
+library(e1071)
+
+```
+
+```{r, echo=FALSE,message=FALSE,warning=FALSE}
+# Loading data
+df_train <- read.csv("data/moneyball-training-data.csv")
+df_eval  <- read.csv("data/moneyball-evaluation-data.csv")
+```
+
+# Data Exploration
+
+## Summary and Descriptive Statistics
+
+Here are summary statistics for the training data set.
+
+```{r, echo=FALSE}
+stargazer(df_train[ , !(names(df_train) %in% "INDEX")],
+          type = "text", title = "Summary Statistics")
+
+```
+
+\clearpage
+
+**What these summary statistics show**
+
+There are 16 variables describing a professional baseball team's offensive and defensive statistics. These include batting statistics such as TEAM_BATTING_HR for home runs, pitching statistics, like TEAM_PITCHING_SO for strikeouts, and fielding statistics like TEAM_FIELDING_E for errors. The data covers about 2,200 records that represent a professional baseball team from 1871 to 2006 inclusive.
+
+We can also already see that some variables have missing data. For example, HPB only has 191 observations. This will be useful to keep in mind later when addressing missing data.
+
+**Categorically, the variables fit into these groups:**
+
+-   **Batting**: hits (H), doubles (2B), triples (3B), home runs (HR), walks (BB), strikeouts (SO) and hit by pitches (HBP).
+
+-   **Base running**: steals (SB), and caught stealing (CS)
+
+-   **Pitching**: hits given up (H), home runs given up (HR) walks given up (BB), and strikeouts (SO).
+
+-   **Fielding**: errors committed (E), and double plays turned (DP).
+
+    The final key variable is **TARGET_WINS**, representing the number of wins each team achieved in that season. Interesting to note is the minimum wins in a season is 0 (seems unlikely) and the maximum is 146 (exceptionally high, never actually done in MLB). So we will keep an eye on the legitimacy of the data and the predictability of the models later on.
+
+Next we will look at some visualizations of the data to get a better understanding of its distribution, correlation and if any data is missing.
+
+## Visualizations of Data
+
+### Distribution and Correlation of the Variables
+
+```{r, echo=FALSE}
+library(ggplot2)
+
+ggplot(df_train, aes(x = TARGET_WINS)) + 
+  geom_histogram(bins = 30, color = "steelblue") + 
+  labs(
+    title = "Distribution of Team Wins",
+    x = "Team Wins",
+    y = "Number of Teams"
+  )
+#Compute correlations using only complete observations
+num_cols <- sapply(df_train, is.numeric)
+
+cor_vec <- cor(df_train[, num_cols], 
+               use = "complete.obs")[, "TARGET_WINS"]
+
+#Store in data frame
+cor_df <- data.frame(
+  variable = names(cor_vec),
+  correlation = cor_vec
+)
+
+
+#Bar chart
+ggplot(cor_df, aes(x = reorder(variable, correlation),
+                   y = correlation)) + 
+  geom_col(fill = "steelblue") + 
+  coord_flip() + 
+  labs(title = "Correlation with Team Wins",
+       x = "Variable", y = "Correlation")
+```
+
+The first visualization shows a relatively normal (bell curve) distribution of team wins compared to the number of teams. The average is around 80 to 81 wins per team.
+
+The second visualization shows the variables positively correlated with wins from the batting perspective are hits, home runs, doubles, and hit by pitches. From the pitching side, hits given up, walks given up, and home runs given up are positively correlated.
+
+### Missing Data
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+library(naniar)
+gg_miss_var(df_train, show_pct = TRUE) + 
+  coord_flip() + 
+  scale_y_continuous(breaks = seq(0, 100, by = 10)) + 
+  labs(title = "% Missing By Variable",
+       x = "Variable",
+       y = "% Missing")
+```
+
+This last visualization shows that there is some missing data in this data set.
+
+This graph shows that there are 6 variables that are missing information. Hit by pitches have the highest percentage of missing data, at around 92%. This means that roughly 92% of team-seasons don't have a hit by pitch number, so only about 8% of the rows actually contain a usable HBP value.
+
+\newpage
+
+# Data Preparation
+
+## Dealing with missing variables
+
+Because HBP is missing over 90% of observations, I decided to drop the variable entirely. There is too much missing data to try to accurately impute numbers for HBP, and it doesn't appear to be a highly explanatory variable for wins anyway based on the correlation chart. For the second most missing variable, TEAM_BASERUNNING_CS or caught stealing, I decided to impute the numbers since roughly 40% is missing. Caught stealing data is also informative for predicting wins since getting caught stealing leads to an out and takes a runner out of scoring possibility.
+
+However before imputing, lets look at the distribution of the variable.
+
+```{r, echo=FALSE, warning=FALSE}
+
+#Before imputing
+ggplot(df_train, aes(x = TEAM_BASERUN_CS)) +
+  geom_histogram(binwidth = 10, fill = "steelblue", color = "white") +
+  labs(
+    title = "Caught Stealing Before Imputation",
+    x = "Caught Stealing",
+    y = "Number of Teams"
+  )
+```
+
+I imputed using the median, since it is less sensitive to outliers than imputing using the mean. While any imputation is not perfect, median is the best way to impute (without over complication). Since caught stealing is Missing at Random (MAR) because it was not recorded early on, using median preserves the central tendency of the distribution without introducing strong assumptions.
+
+Before imputing, I also flag the missing variables (all not just HPB and CS) to use later on.
+
+The following graph shows the distribution **after** the imputation.
+
+```{r, echo=FALSE}
+# Create flags for ALL variables that have any missing values,
+# 1 = missing, 0 = present
+
+cols_with_na <- names(which(colSums(is.na(df_train)) > 0))
+
+df_train <- df_train %>%
+  mutate(
+    across(
+      all_of(cols_with_na),
+      ~ as.integer(is.na(.)),                 
+      .names = "{.col}_miss"
+    )
+  )
+
+# 2) Impute TEAM_BASERUN_CS with its median (computed on observed values)
+cs_median <- median(df_train$TEAM_BASERUN_CS, na.rm = TRUE)
+df_train <- df_train %>%
+  mutate(
+    TEAM_BASERUN_CS = ifelse(is.na(TEAM_BASERUN_CS), cs_median, TEAM_BASERUN_CS)
+  )
+
+#Graph of after the imputation
+
+  ggplot(df_train, aes(x = TEAM_BASERUN_CS)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  labs(
+    title = "Distribution of Caught Stealing After Imputation",
+    x = "Caught Stealing (CS)",
+    y = "Number of Teams"
+  )
+
+```
+
+The large spike at 50 is due to the missing data being replaced by the median (\~50). Although this clearly makes the data less robust, when performing regression analysis the missing values are flagged so we can distinguish between actual and imputed data and decide which model yields the best results.
+
+## Using Buckets
+
+I decided to create win-range buckets to more easily describe success levels for teams, and to see how certain variables are more or less prevalent with successful vs unsuccessful teams.
+
+**Win Buckets**
+
+-   **0-70 wins**, unsuccessful teams, lost more games than they won.
+
+-   **70-79 wins**, less than .500 (even record) so still unsuccessful
+
+-   **80-89 wins** , successful teams most above .500
+
+-   **90-99 wins**, very successful teams, likely made playoffs
+
+-   **\>100 wins**, exceptional teams, almost guaranteed to have made playoffs
+
+These buckets are useful for a multitude of reasons. For example, we should expect based on theory that teams with more home runs are in the higher win buckets. We can see in this visual that almost no teams with less than 70 wins had more than 150 home runs (purple). We also see that many of the successful teams (89-100+ wins) had over 100 home runs.
+
+```{r, echo=FALSE}
+#Create buckets for groups of wins to organize the data more
+#Also create buckets for home runs to group them
+df_train <- df_train %>%
+  mutate(
+    win_group = cut(
+      TARGET_WINS,
+      breaks = c(-Inf, 69, 79, 89, 99, Inf),
+      labels = c("<70", "70-79", "80-89", "90-99", ">=100")
+    ),
+    Homeruns = cut(
+      TEAM_BATTING_HR,
+      breaks = c(-Inf, 50, 100, 150, Inf),
+      labels = c("≤50", "51–100", "101–150", ">150")
+    )
+  )
+
+# Chart showing home-run buckets by win bucket
+ggplot(df_train, aes(x = win_group, fill = Homeruns)) +
+  geom_bar(position = "dodge") +
+  labs(title = "Home Run Buckets by Win Range",
+       x = "Win Range", y = "Number of Teams")
+```
+
+Only a small share of team-seasons achieved more than 100 wins, so counts in that category are limited. The bars in the 100+ win range therefore represent rare, exceptional teams
+
+## Additional Variables and Transformations
+
+### Additional Variable: OPS
+
+I also decided to create an additional variable for team on base plus slugging percentage (OPS). This statistic is often used in Major League Baseball so I thought it would be valuable to include to help predict total wins. While on base percentage and slugging percentage is not available in the data set, but I can calculate a rough estimate using the variables we do have.
+
+I did this by calculating the number of singles and then total bases. Then a proxy estimate for at bats, by adding hits plus strikeouts. This is not a perfect measure since at bats also includes outs besides strikeouts. These out metrics are not available in the dataset, so OPS is inflated a bit than real OPS statistics. Still, it is a useful metric since it weighs home runs and doubles more heavily than singles (due to slugging percentage). Slugging percentage was calculated by dividing total bases (1×singles + 2×doubles + 3×triples + 4×home runs) by proxy_AB (hits + strikeouts).
+
+```{r,warning=FALSE,message=FALSE}
+df_train <- df_train %>%
+  mutate(
+    # rough calculation of total bases:
+    # 1*singles + 2*doubles + 3*triples + 4*home runs
+    
+    singles = TEAM_BATTING_H - (TEAM_BATTING_2B +
+                                TEAM_BATTING_3B +
+                                TEAM_BATTING_HR),
+
+    total_bases = singles + 2*TEAM_BATTING_2B +
+                  3*TEAM_BATTING_3B + 4*TEAM_BATTING_HR,
+
+    # proxy at-bats (walks are not at-bats)
+    proxy_AB = TEAM_BATTING_H + TEAM_BATTING_SO,
+
+    # approximate OBP (hits + walks over AB + walks)
+    OBP_proxy = (TEAM_BATTING_H + TEAM_BATTING_BB) /
+                pmax(proxy_AB + TEAM_BATTING_BB, 1),
+
+    # approximate SLG
+    SLG_proxy = total_bases / pmax(proxy_AB, 1),
+
+    # OPS-like metric
+    OPS_proxy = OBP_proxy + SLG_proxy
+  )
+
+# Graph to show that OPS_proxy relates to team wins
+ggplot(df_train, aes(x = OPS_proxy, y = TARGET_WINS)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", se = FALSE, color = "steelblue") +
+  labs(title = "Relationship of OPS Metric to Team Wins",
+       x = "OPS (proxy)", y = "Wins")
+```
+
+This visualization shows that the new OPS variable is positively correlated with wins. The higher OPS teams had more wins on average.
+
+### Dealing with Skewness
+
+Before going into building models, I also want to test to see if any variables display skewness. If they do, I would mathematically transform them to make them more useful for interpretation.
+
+```{r, include=FALSE}
+
+library(e1071)
+sapply(df_train[sapply(df_train, is.numeric)], function(x) skewness(x, na.rm = TRUE))
+#Most skewed is team_pitching_so, team_pitching_H is also skewed
+```
+
+```{r}
+skewness(df_train$TEAM_PITCHING_SO, na.rm = TRUE)
+skewness(df_train$TEAM_PITCHING_H,  na.rm = TRUE)
+
+```
+
+These numbers show that strikeouts and hits (from the pitching perspective) are skewed to the right. This means strikeouts and hits are heavily concentrated at lower values and contain some large outliers, which effects the distribution. To account for this, I transform the two variables using log1p to compress the right tail.
+
+```{r}
+
+#Transform the two pitching variables to reduce skewness
+#log1p takes the natural log of (1 +x) to smooth out data
+df_train <- df_train %>%
+  mutate(
+    log1p_TEAM_PITCHING_SO = log1p(TEAM_PITCHING_SO),
+    log1p_TEAM_PITCHING_H  = log1p(TEAM_PITCHING_H)
+  )
+psych::describe(df_train$log1p_TEAM_PITCHING_SO)$skew
+psych::describe(df_train$log1p_TEAM_PITCHING_H)$skew
+
+```
+
+After transforming the variables, the skew is far less than leaving them as default.
+
+## Final Summary Statistics Table
+
+```{r, echo=FALSE,warning=FALSE,message=FALSE}
+
+#These are the final variables I will be considering for my regressions
+final_variables <- c(
+  "TARGET_WINS",
+  "TEAM_BATTING_H",
+  "TEAM_BATTING_HR",
+  "TEAM_BATTING_BB",
+  "TEAM_BATTING_2B",
+  "TEAM_BATTING_3B",
+  "OPS_proxy",
+  "log1p_TEAM_PITCHING_SO",
+  "log1p_TEAM_PITCHING_H",
+  "TEAM_FIELDING_E",
+  "TEAM_FIELDING_DP",
+  "TEAM_BASERUN_SB",
+  "TEAM_BASERUN_CS"
+)
+
+#Create a final data frame
+df_final <- df_train %>% select(all_of(final_variables))
+
+#Use stargazer to create the final table
+stargazer(df_final,
+          type   = "text",
+          title  = "Summary Statistics: Final Regression Variables",
+          digits = 2,
+          summary = TRUE)
+
+```
+
+\newpage
+
+This final summary statistics includes 12 explanatory variables and one dependent variable (target wins). I included the OPS metric I created as well as the two transformed variables. Beyond this I include hits, home runs, walks, doubles, triples, fielding errors, double plays, stolen bases and caught stealing (after median imputation). I will not use all 12 variables in each model, but this table shows what I am pulling from for the models.
+
+# Building Models
+
+## Model 1
+
+The first model is the simplest, just using the core offensive numbers to see how useful they are at predicting wins. The independent variables are TEAM_BATTING_H (hits), TEAM_BATTING_HR (home runs), and TEAM_BATTING_BB (walks). This model only focuses on the offense to see how the offensive metrics are predictive of team wins.
+
+**Estimating Equation**
+
+$$
+\mathit{WINS}_i = \beta_0 + \beta_1 H_i + \beta_2 HR_i + \beta_3 BB_i + \varepsilon_i$$
+
+```{r,echo=FALSE,warning=FALSE}
+#First model, only offensive variables
+model1 <- lm(TARGET_WINS ~ TEAM_BATTING_H + TEAM_BATTING_HR + TEAM_BATTING_BB,
+             data = df_train)
+stargazer(model1, type = "text",
+          title = "Regression Results: Model One",
+          digits = 3,
+          align = TRUE,
+          no.space = TRUE)
+```
+
+**Coefficients**
+
+The coefficients for all three independent variables are positive, which makes sense based on theory. We should expect hits, home runs, and walks to positively relate to wins. Specifically, each hit is associated with roughly 0.044 more wins in a season, while each home run leads to 0.015 more wins and walks leading to 0.029 more wins.
+
+**Significance**
+
+Both hits and walks are statistically significant at all three traditional thresholds, 10%, 5% and 1%. However, the adjusted R squared is low at 0.2211. Only roughly 22% of the variation in wins is explained by batting hits, home runs, and walks. While this is a decent model to start, there are likely better models with the variables we have available.
+
+## Model 2
+
+The second model uses the two transformed pitching variables, strike outs and hits given up to see how pitching can impact games won. I also included errors, to examine how important defense is to winning games. Therefore the variables used are log1p_TEAM_PITCHING_SO (the transformed strike outs variable), log1p_TEAM_PITCHING_H (the transformed hits given up variable) and TEAM_FIELDING_E (errors).
+
+**Estimating Equation**
+
+$$
+\mathit{Wins}_i=\beta_0+\beta_1\mathit{log1p\_PitchingSO}_i+\beta_2\mathit{log1p\_PitchingH}_i+\beta_3\mathit{FieldingE_i}
+$$
+
+\newpage
+
+```{r, echo=FALSE,warning=FALSE}
+#Model 2, only using defensive and pitching metrics to examine their
+#effects on wins
+model2 <- lm(
+  TARGET_WINS ~ log1p_TEAM_PITCHING_SO +
+                log1p_TEAM_PITCHING_H +
+                TEAM_FIELDING_E,
+  data = df_train
+)
+#stargazer for model summary
+stargazer(model2, type = "text",
+          title = "Regression Results: Model Two",
+          digits = 3,
+          align = TRUE,
+          no.space = TRUE)
+
+```
+
+**Coefficients**
+
+While the three explanatory variables at statistically significant at 1%, the coefficients sign is not consistent with what we should expect based on theory. We should expect more strike outs to lead to more wins (positive coefficient). Similarly we should expect hits to have a negative coefficient since giving up more hits should not lead to additional wins. The sign of the coefficient on errors is consistent with theory though, since more errors should lead to less wins (negative sign).
+
+**Significance**
+
+As mentioned the three variables are statistically significant. However, there is again concern with an even lower adjusted R square measure at 0.085. Only 8.5% of the variation in wins is because of these variables. This makes this model not very powerful, and not usable for analysis.
+
+Despite the low adjusted R squared, Model 2 is still valuable for comparison and completeness. It isolates pitching and defensive performance, allowing us to see how much team success can be explained by run prevention alone. Showing that these variables account for only about 8.5 % of win variation highlights the relative importance of offense and underscores that pitching and defense, while statistically significant, play a more limited role in this data set than batting.
+
+## Model 3
+
+The third model combines offensive, defensive and pitching variables to create a complete model. It includes the proxy OPS variable I created, but no other offensive variables due to risk of multicollinearity. For pitching it includes the two transformed variables hits and strike outs again. For fielding, I included fielding errors and double plays. Finally I included both base running metrics, stolen bases and caught stealing.
+
+**Estimating Equation**
+
+$$
+\begin{aligned}\mathit{Wins}_i &= \beta_0 + \beta_1 \mathit{OPS}_i  + \beta_2 \mathit{log1p\_PitchingSO}_i  + \beta_3 \mathit{log1p\_PitchingH}_i \\ &\quad + \beta_4 \mathit{FieldingE}_i  + \beta_5 \mathit{FieldingDP}_i  + \beta_6 \mathit{SB}_i  + \beta_7 \mathit{CS}_i  + \varepsilon_i\end{aligned}\
+$$
+
+```{r,echo=FALSE,warning=FALSE}
+model3 <- lm(
+  TARGET_WINS ~ OPS_proxy + log1p_TEAM_PITCHING_SO +
+                log1p_TEAM_PITCHING_H +
+                TEAM_FIELDING_E + TEAM_FIELDING_DP + TEAM_BASERUN_SB + TEAM_BASERUN_CS,
+  data = df_train
+)
+#stargazer for model summary
+stargazer(model3, type = "text",
+          title = "Regression Results: Model Three",
+          digits = 3,
+          align = TRUE,
+          no.space = TRUE)
+```
+
+**Coefficients**
+
+The signs of OPS, errors, stolen bases and caught stealing are consistent with the theory. OPS should be positively related to wins, errors should be negatively related, stolen bases should be positive, and caught stealing should be negative.
+
+However, some signs are unexpected. For example, double plays should have a positive coefficient based on theory, more double plays turned should lead to additional wins. Also, similar to model 2, the two pitching variables have unexpected signs. This likely reflects the structure of the data set: modern teams play longer seasons and therefore accumulate more strikeouts and hits while also recording more wins. The unexpected signs is likely to due how baseball has evolved over 100 years. I decided to keep the pitching metrics in the model anyway, because they help capture the variation in wins and are statistically significant.
+
+**Significance**
+
+All seven variables are statistically significant at the highest 1% threshold. Including more variables has also increased the adjusted R squared to 0.339, meaning roughly 33.9% of the variation in total wins can be explained using these variables.
+
+## Model 4
+
+For fun, I decided to create a fourth model with even more variables to see how R squared would be affected. While its important to note simply adding variables does not improve the accuracy of the model, model 4's purpose is to show how the regression would look by omitting OPS and including the bulk of the offensive, defensive, and pitching variables.
+
+**Estimating Equation**
+
+$$ \begin{aligned}\mathit{WINS}_i &= \beta_0   + \beta_1 H_i  + \beta_2 HR_i  + \beta_3 BB_i  + \beta_4 2B_i  + \beta_5 3B_i \\ &\quad + \beta_6 SB_i  + \beta_7 \mathit{log1p\_PitchingSO}_i  + \beta_8 \mathit{log1p\_PitchingH}_i \\ &\quad + \beta_9 E_i  + \beta_{10} DP_i  + \varepsilon_i\end{aligned} $$
+
+\newpage
+
+```{r,echo=FALSE,warning=FALSE}
+model4 <- lm(
+  TARGET_WINS ~ TEAM_BATTING_H +
+    TEAM_BATTING_HR +
+    TEAM_BATTING_BB +
+    TEAM_BATTING_2B +
+    TEAM_BATTING_3B +
+    TEAM_BASERUN_SB +
+    log1p_TEAM_PITCHING_SO +
+    log1p_TEAM_PITCHING_H +
+    TEAM_FIELDING_E +
+    TEAM_FIELDING_DP,
+  data = df_train
+)
+
+stargazer(model4, type = "text",
+          title = "Regression Results: Model Four",
+          digits = 3,
+          align = TRUE,
+          no.space = TRUE)
+
+```
+
+**Coefficients**
+
+The signs remain the roughly the same as the previous model, with some expected signs (hits, home runs, walks, triples, stolen bases) and some unexpected (doubles, hits given up). It is interesting to note that pitching strike outs now has the expected positive sign, however it is no longer statistically significant at the traditional three thresholds.
+
+**Significance**
+
+As mentioned above, pitching strikeouts is no longer statistically significant, nor is batting hits. The purpose of the model was to obtain a higher adjusted R squared, which is does successfully now reaching 0.598 or nearly 60% of the variation in wins predicted.
+
+# Model Selection
+
+## Multicollinearity check
+
+```{r,echo=FALSE,message=FALSE,warning=FALSE}
+library(car)
+library(dplyr)
+
+# Combine VIFs into one table
+vif_tbl <- bind_rows(
+  data.frame(Model = "Model 1", Variable = names(vif(model1)), VIF = as.numeric(vif(model1))),
+  data.frame(Model = "Model 2", Variable = names(vif(model2)), VIF = as.numeric(vif(model2))),
+  data.frame(Model = "Model 3", Variable = names(vif(model3)), VIF = as.numeric(vif(model3))),
+  data.frame(Model = "Model 4", Variable = names(vif(model4)), VIF = as.numeric(vif(model4)))
+)
+
+# Filter to only show VIF > 5
+vif_tbl_filtered <- vif_tbl %>%
+  filter(VIF > 5) %>%
+  arrange(desc(VIF))
+
+vif_tbl_filtered
+
+
+```
+
+## Model 3 Alteration
+
+After checking for multicollinearity issues in the model, I've decided to slightly alter model three by dropping pitching strike outs from the model. While this will reduce the amount of information the model uses, the VIF analysis showed that pitching strikeouts were highly collinear with OPS, which can inflate standard errors and distort coefficient estimates. Additionally since the expected sign of pitching strikeouts was incorrect anyway, this proves to be worthwhile variable to drop in the end.
+
+**Updated Estimating Equation**
+
+$$
+\begin{aligned}\mathit{WINS}_i &= \beta_0   + \beta_1 \mathit{OPS}_i  + \beta_2 \mathit{log1p\_PitchingH}_i \\  &\quad + \beta_3 \mathit{FieldingE}_i  + \beta_4 \mathit{FieldingDP}_i  + \beta_5 SB_i  + \beta_6 CS_i  + \varepsilon_i\end{aligned}
+$$
+
+\newpage
+
+**Updated Regression Results**
+
+```{r,echo=FALSE,warning=FALSE}
+model3_updated <- lm(
+  TARGET_WINS ~ OPS_proxy + log1p_TEAM_PITCHING_H +
+                TEAM_FIELDING_E + TEAM_FIELDING_DP +
+                TEAM_BASERUN_SB + TEAM_BASERUN_CS,
+  data = df_train
+)
+
+stargazer(model3_updated,
+          type = "text",
+          title = "Regression Results: Updated Model Three",
+          digits = 3,
+          align = TRUE,
+          no.space = TRUE)
+```
+
+**Updated VIF test**
+
+```{r,echo=FALSE}
+library(car)
+vif(model3_updated)
+```
+
+The VIF test for the updated model 3 shows there are no longer multicollinearity concerns.
+
+After this refinement, I've selected the **updated model 3** as the best model.
+
+**Model 1** (offense only) explained about 22% of the variation in wins, but ignored pitching and defense.
+
+**Model 2** (pitching and defense only) explained less than 9% of variation, and while coefficients were statistically significant, many had counterintuitive signs, reflecting historical era effects.
+
+**Model 4** achieved the highest adjusted R squared at nearly 60%, but at the cost of including many overlapping offensive variables, creating multicollinearity and reducing interpretability.
+
+**The original model 3** had issues with multicollinearity and interpretation issues with the unexpected sign for pitching strike outs.
+
+**Finally, the updated model 3** has the best balance of pitching, hitting, and defensive metrics while eliminating the previous multicollinearity concerns. While the adjusted R squared might be lower than other models, this sacrifice is worthwhile because of its strong interpretative value and lack of multicollinearity.
+
+## Residual Visualizations
+
+**Residuals vs Fitted Values for the Updated Model 3**
+
+```{r, warning=FALSE,echo=FALSE}
+library(ggplot2)
+library(broom)
+#augment used from broom package to add residuals
+aug3 <- augment(model3_updated)
+
+#ggplot used to create the graph
+ggplot(aug3, aes(.fitted, .resid)) +
+  geom_point(alpha = 0.5, color = "steelblue") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "Residuals vs Fitted Values Updated Model 3",
+       x = "Fitted Values",
+       y = "Residuals")
+```
+
+This shows there are no clear patterns, and relatively even spread without many extreme outliers. This makes this model strong for predicting total team wins.
+
+The F-statistic for the updated model 3 is large at 141.5, so the variation explained by the model is larger than the unexplained variation.
+
+## Predictions
+
+```{r,echo=FALSE,message=FALSE,warning=FALSE}
+library(dplyr)
+library(tidyr)
+
+#Create the same variables from the training set in the evaluation set
+df_eval2 <- df_eval %>%
+  mutate(
+    # coalesce core inputs
+    TEAM_BATTING_H   = coalesce(TEAM_BATTING_H, 0),
+    TEAM_BATTING_2B  = coalesce(TEAM_BATTING_2B, 0),
+    TEAM_BATTING_3B  = coalesce(TEAM_BATTING_3B, 0),
+    TEAM_BATTING_HR  = coalesce(TEAM_BATTING_HR, 0),
+    TEAM_BATTING_SO  = coalesce(TEAM_BATTING_SO, 0),
+    TEAM_BATTING_BB  = coalesce(TEAM_BATTING_BB, 0),
+    TEAM_PITCHING_SO = coalesce(TEAM_PITCHING_SO, 0),
+    TEAM_PITCHING_H  = coalesce(TEAM_PITCHING_H, 0),
+
+    singles     = TEAM_BATTING_H - (TEAM_BATTING_2B + TEAM_BATTING_3B + TEAM_BATTING_HR),
+    total_bases = singles + 2*TEAM_BATTING_2B + 3*TEAM_BATTING_3B + 4*TEAM_BATTING_HR,
+
+    proxy_AB   = TEAM_BATTING_H + TEAM_BATTING_SO,
+    OBP_proxy  = (TEAM_BATTING_H + TEAM_BATTING_BB) / pmax(proxy_AB + TEAM_BATTING_BB, 1),
+    SLG_proxy  = total_bases / pmax(proxy_AB, 1),
+    OPS_proxy  = OBP_proxy + SLG_proxy,
+
+    log1p_TEAM_PITCHING_SO = log1p(TEAM_PITCHING_SO),
+    log1p_TEAM_PITCHING_H  = log1p(TEAM_PITCHING_H)
+  ) %>%
+  
+  #Replace the NA values since there were many NA values
+  mutate(across(where(is.numeric), ~replace_na(., 0)))
+
+#Prediction
+df_eval2$Predicted_WINS <- predict(model3_updated, newdata = df_eval2)
+
+#Preview of 10 of the teams projected wins
+head(df_eval2[c("INDEX", "Predicted_WINS")], 10)
+
+
+```
+
+This shows that based on my updated model three, these teams are expected to win this many games based on their offensive, defensive and pitching metrics used in the updated model 3. To keep the report simple, only 10 teams are represented here.
+
+# Conclusion
+
+Overall, the analysis shows that team performance can be reasonably predicted from a combination of batting, pitching, defensive, and base running statistics. While the model is not perfect, and baseball can be an unpredictable game with luck and randomness playing a part in winning games, it is still valuable. With more data and additional refinements, the predictions could be improved further, but even in its current form the project highlights the power of econometric modeling in sports analysis.
